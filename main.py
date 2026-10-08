@@ -314,6 +314,192 @@ def _account_blocked(account_id: str) -> bool:
     return bool(snap.exists and (snap.to_dict() or {}).get("status") == "blocked")
 
 
+# ─── PCs and sign-ins ─────────────────────────────────────────────────────────
+# Two things the panel owner decides per account, and that only this side can
+# hold a customer to, because every pharmacy PC keeps its own database and none
+# of them can see another:
+#
+#   maxDevices       how many PCs the account may be installed on (the panel
+#                    sets 1 on a new account; unset means not limited).
+#                    Each PC that activates, or signs a member of staff in,
+#                    takes a seat in accounts/{id}.devices. A PC with no seat
+#                    is refused once the seats are full. The owner frees one by
+#                    removing that PC in the panel.
+#
+#   allowMultiLogin  whether ONE login may be signed in on several PCs at the
+#                    same time (default no). When it may not, the newest
+#                    sign-in holds sessions/{uid} and the app on the other PC
+#                    signs itself out.
+#
+# Both are answers the customer's PC acts on; neither grants anything.
+
+DEVICE_LIMIT = "Device limit reached"
+
+
+def _device_args(args: dict) -> tuple:
+    """(device_id, device_name), or ("", "") from a build that sends none."""
+    device_id = str(args.get("device_id") or "").strip().lower()
+    if not device_id:
+        return "", ""
+    # Used as a Firestore field name inside `devices`, so it is held to what a
+    # field path accepts unquoted: a letter, then letters and digits.
+    if not (8 <= len(device_id) <= 64 and device_id[0].isalpha()
+            and device_id.isascii() and device_id.isalnum()):
+        raise HTTPException(400, "Invalid device id")
+    return device_id, str(args.get("device_name") or "")[:60]
+
+
+def _max_devices(account: dict) -> int:
+    """
+    How many PCs the account is licensed for; 0 when the owner has not said.
+
+    "Not said" is every account created before PCs were counted, and some of
+    those customers already run two tills. Holding them to one the day this
+    shipped would have locked the second till out of its own shop, so an
+    account is counted but not limited until the owner gives it a number —
+    which the panel does for every new account, and on the next edit of an
+    old one.
+    """
+    raw = account.get("maxDevices")
+    if raw is None or raw == "":
+        return 0
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _account_limits(account: dict) -> dict:
+    def n(key: str, default: int) -> int:
+        try:
+            return max(0, int(account.get(key)))
+        except (TypeError, ValueError):
+            return default
+    return {
+        "admins": max(1, n("admins", 1)),
+        "cashiers": n("cashiers", 0),
+        "pharmacists": n("pharmacists", 0),
+        "warehouse": n("warehouse", 0),
+    }
+
+
+def _seat(transaction, acc_ref, account: dict, device_id: str, device_name: str) -> None:
+    """Keep this PC's seat on the account, give it one, or refuse. Writes only."""
+    devices = account.get("devices") or {}
+    if not isinstance(devices, dict):
+        devices = {}
+    if device_id in devices:
+        transaction.update(acc_ref, {
+            f"devices.{device_id}.lastSeen": firestore.SERVER_TIMESTAMP,
+            f"devices.{device_id}.name": device_name,
+        })
+        return
+    allowed = _max_devices(account)
+    if allowed and len(devices) >= allowed:
+        raise HTTPException(
+            403,
+            f"{DEVICE_LIMIT}: this account is licensed for {allowed} PC(s) and all "
+            f"of them are in use. Contact the developer to add this PC.",
+        )
+    transaction.update(acc_ref, {f"devices.{device_id}": {
+        "name": device_name,
+        "firstSeen": firestore.SERVER_TIMESTAMP,
+        "lastSeen": firestore.SERVER_TIMESTAMP,
+    }})
+
+
+def _account_of(caller: dict) -> str:
+    """
+    The panel account a signed-in member of staff belongs to; "" for a login no
+    account owns (a self-hosted install, or one from before accounts existed).
+
+    Read from claims this relay wrote: the admin carries `account`; staff carry
+    it too on newer builds, and otherwise `created_by` names their admin.
+    """
+    account = str(caller.get("account") or "")
+    if account:
+        return account
+    creator = str(caller.get("created_by") or "")
+    if creator:
+        try:
+            account = str((fb_auth.get_user(creator).custom_claims or {}).get("account") or "")
+        except Exception:
+            account = ""
+        if account:
+            return account
+    docs = list(firestore.client().collection("accounts")
+                .where("adminUid", "==", _caller_uid(caller)).limit(1).get())
+    return docs[0].id if docs else ""
+
+
+def _op_device_register(args: dict, caller: Optional[dict]):
+    """
+    A member of staff has signed in on a PC. Seat the PC on their account (or
+    refuse it), record this as their newest sign-in, and hand back what the
+    panel currently says about the account — so a limit the owner changed
+    reaches a PC that was activated long ago.
+
+    Returns None for a login no panel account owns: nothing to enforce.
+    """
+    caller = _require_caller(caller)
+    device_id, device_name = _device_args(args)
+    if not device_id:
+        raise HTTPException(400, "Missing argument: device_id")
+    session_id = str(args.get("session_id") or "")[:80]
+
+    account_id = _account_of(caller)
+    if not account_id:
+        return None
+
+    client = firestore.client()
+    acc_ref = client.collection("accounts").document(account_id)
+
+    @firestore.transactional
+    def _run(transaction):
+        snap = acc_ref.get(transaction=transaction)
+        if not snap.exists:
+            return None
+        account = snap.to_dict() or {}
+        if account.get("status") == "blocked":
+            raise HTTPException(403, "This account has been blocked. Contact the developer.")
+        _seat(transaction, acc_ref, account, device_id, device_name)
+        return account
+
+    account = _run(client.transaction())
+    if account is None:
+        return None
+
+    if session_id:
+        client.collection("sessions").document(_caller_uid(caller)).set({
+            "deviceId": device_id,
+            "deviceName": device_name,
+            "sessionId": session_id,
+            "accountId": account_id,
+            "at": firestore.SERVER_TIMESTAMP,
+        })
+
+    return {
+        "account": account_id,
+        "max_devices": _max_devices(account),
+        "allow_multi_login": bool(account.get("allowMultiLogin")),
+        "limits": _account_limits(account),
+    }
+
+
+def _op_session_active(args: dict, caller: Optional[dict]):
+    """Where the CALLER's newest sign-in is: {device_id, session_id}, or None."""
+    caller = _require_caller(caller)
+    snap = firestore.client().collection("sessions").document(_caller_uid(caller)).get()
+    if not snap.exists:
+        return None
+    data = snap.to_dict() or {}
+    return {
+        "device_id": str(data.get("deviceId") or ""),
+        "session_id": str(data.get("sessionId") or ""),
+        "device_name": str(data.get("deviceName") or ""),
+    }
+
+
 def _op_activation_claim(args: dict, caller: Optional[dict]):
     """
     Redeem an activation code: verify it, burn it, and grant admin to the
@@ -333,8 +519,13 @@ def _op_activation_claim(args: dict, caller: Optional[dict]):
     if not code or not code.isalnum() or len(code) != 16:
         raise HTTPException(400, "Invalid activation code")
 
+    # The PC redeeming it. An older build sends none and is activated as it
+    # always was — it simply takes no seat until it signs somebody in.
+    device_id, device_name = _device_args(args)
+
     client = firestore.client()
     code_ref = client.collection("activationCodes").document(code)
+    seat = {}
 
     # A transaction, because two tills redeeming the same code at the same
     # moment must not both succeed. Read-check-write inside one makes the
@@ -358,12 +549,33 @@ def _op_activation_claim(args: dict, caller: Optional[dict]):
             except ValueError:
                 pass        # an unparseable expiry is treated as no expiry
 
-        if _account_blocked(str(data.get("accountId") or "")):
+        # The account is read INSIDE the transaction: the seat count must be
+        # the one this redemption is judged against, and a refusal has to come
+        # before the code is spent — a customer told "no room for this PC"
+        # must still be holding a code that works once room is made.
+        account_id = str(data.get("accountId") or "")
+        acc_ref = client.collection("accounts").document(account_id) if account_id else None
+        account = None
+        if acc_ref is not None:
+            try:
+                acc_snap = acc_ref.get(transaction=transaction)
+                account = (acc_snap.to_dict() or {}) if acc_snap.exists else None
+            except Exception:
+                account = None      # an unreadable account doc must not break activation
+
+        if account and account.get("status") == "blocked":
             raise HTTPException(403, "This account has been blocked. Contact the developer.")
+
+        if account is not None:
+            seat["max_devices"] = _max_devices(account)
+            seat["allow_multi_login"] = bool(account.get("allowMultiLogin"))
+            if device_id:
+                _seat(transaction, acc_ref, account, device_id, device_name)
 
         transaction.update(code_ref, {
             "used": True,
             "usedBy": data.get("adminEmail") or "",
+            "usedOn": device_name,
             "usedAt": firestore.SERVER_TIMESTAMP,
         })
         return data
@@ -396,6 +608,8 @@ def _op_activation_claim(args: dict, caller: Optional[dict]):
         "limits": data.get("limits") or {},
         "admin_email": admin_email,
         "admin_granted": admin_granted,
+        "max_devices": seat.get("max_devices", 0),
+        "allow_multi_login": seat.get("allow_multi_login", False),
     }
 
 
@@ -537,6 +751,8 @@ HANDLERS = {
     "user.set_claims": _op_user_set_claims,
     "activation.claim": _op_activation_claim,
     "account.claim_admin": _op_account_claim_admin,
+    "device.register": _op_device_register,
+    "session.active": _op_session_active,
     "fs.get": _op_fs_get,
     "fs.query": _op_fs_query,
     "fs.update": _op_fs_update,
