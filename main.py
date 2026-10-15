@@ -538,8 +538,7 @@ def _op_activation_claim(args: dict, caller: Optional[dict]):
         data = snap.to_dict() or {}
         if data.get("revoked"):
             raise HTTPException(400, "This activation code has been revoked")
-        if data.get("used"):
-            raise HTTPException(400, "This activation code has already been used")
+        already_used = bool(data.get("used"))
 
         exp = str(data.get("exp") or "")
         if exp:
@@ -566,18 +565,33 @@ def _op_activation_claim(args: dict, caller: Optional[dict]):
         if account and account.get("status") == "blocked":
             raise HTTPException(403, "This account has been blocked. Contact the developer.")
 
+        # One code is the account's licence for as many PCs as the owner sold
+        # it for (maxDevices: 1, 2, 3 …). Once spent it may be entered again:
+        #   • on a PC that already holds one of the account's seats — the same
+        #     PC reinstalled, or its database restored — and
+        #   • on a new PC while the account still has a free seat (_seat
+        #     below refuses it, "Device limit reached", once they are all taken).
+        # Never for a code without an account, an old build that sends no PC,
+        # or an account the owner has not given a number of PCs: none of
+        # those can be counted, so the code stays strictly single-use.
+        if already_used and not (account is not None and device_id and _max_devices(account)):
+            raise HTTPException(400, "This activation code has already been used")
+
         if account is not None:
             seat["max_devices"] = _max_devices(account)
             seat["allow_multi_login"] = bool(account.get("allowMultiLogin"))
             if device_id:
                 _seat(transaction, acc_ref, account, device_id, device_name)
 
-        transaction.update(code_ref, {
-            "used": True,
-            "usedBy": data.get("adminEmail") or "",
-            "usedOn": device_name,
-            "usedAt": firestore.SERVER_TIMESTAMP,
-        })
+        spent = {f"pcs.{device_id}": {"name": device_name, "at": firestore.SERVER_TIMESTAMP}} if device_id else {}
+        if not already_used:
+            spent.update({
+                "used": True,
+                "usedBy": data.get("adminEmail") or "",
+                "usedOn": device_name,
+                "usedAt": firestore.SERVER_TIMESTAMP,
+            })
+        transaction.update(code_ref, spent)
         return data
 
     data = _burn(client.transaction())
