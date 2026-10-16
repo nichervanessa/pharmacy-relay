@@ -54,9 +54,13 @@ Deployment: see README.md.
 from __future__ import annotations
 
 import datetime
+import hashlib
 import hmac
+import json
 import logging
 import os
+import re
+import secrets
 from typing import Any, Optional
 
 import firebase_admin
@@ -90,6 +94,11 @@ ALLOWED_COLLECTIONS = {"accounts", "activationCodes", "mobile_dashboard"}
 # limit and lock an account out of logging in entirely.
 ALLOWED_CLAIM_KEYS = {"role", "created_by", "account"}
 ALLOWED_ROLES = {"admin", "cashier", "pharmacist", "warehouse"}
+
+# Dashboard snapshots from builds older than the install token carry nothing
+# but the shared secret. Set RELAY_LEGACY_DASHBOARD_WRITES=0 once every shop
+# runs 1.5.0 or later, and fs.set is closed to the secret alone.
+LEGACY_DASHBOARD_WRITES = (os.getenv("RELAY_LEGACY_DASHBOARD_WRITES") or "1").strip() != "0"
 
 app = FastAPI(title="Pharmacy Firebase Relay", version="2.0.0")
 
@@ -478,12 +487,129 @@ def _op_device_register(args: dict, caller: Optional[dict]):
             "at": firestore.SERVER_TIMESTAMP,
         })
 
-    return {
+    _stamp_account(caller, account_id)
+
+    out = {
         "account": account_id,
         "max_devices": _max_devices(account),
         "allow_multi_login": bool(account.get("allowMultiLogin")),
         "limits": _account_limits(account),
     }
+    if args.get("want_install_token"):
+        out["install_token"] = _mint_install_token(acc_ref, device_id)
+    return out
+
+
+def _stamp_account(caller: dict, account_id: str) -> None:
+    """
+    A login from before staff carried their pharmacy in their token: write it
+    in now, so the PC can tell this pharmacy's staff from another's without
+    asking (the backend refuses a token naming a different account). Merged
+    into the claims already there — the role and creator are kept as they are.
+    """
+    if caller.get("account") or not account_id or caller.get("role") not in ALLOWED_ROLES:
+        return
+    uid = _caller_uid(caller)
+    try:
+        claims = dict(fb_auth.get_user(uid).custom_claims or {})
+        if claims.get("account"):
+            return
+        claims["account"] = account_id
+        fb_auth.set_custom_user_claims(uid, {k: v for k, v in claims.items() if k in ALLOWED_CLAIM_KEYS})
+    except Exception as e:     # never a reason to refuse the sign-in
+        logger.info("could not stamp the account on %s: %s", uid, e)
+
+
+# ─── Branches ─────────────────────────────────────────────────────────────────
+# Each branch's main PC reports itself every few minutes, from a timer — no
+# signed-in user, so no login token. What it holds instead is an INSTALL
+# TOKEN, handed to that PC when somebody signs in on it (device.register).
+# Only the token's hash is kept, on the account, per PC; a report is accepted
+# only with the token, for that account, from that PC. The shared secret alone
+# writes nothing here.
+
+_BRANCH_ID = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+_MAX_REPORT_BYTES = 40_000
+
+
+def _hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _mint_install_token(acc_ref, device_id: str) -> str:
+    token = secrets.token_urlsafe(32)
+    acc_ref.update({f"installTokens.{device_id}": {"hash": _hash(token), "at": firestore.SERVER_TIMESTAMP}})
+    return token
+
+
+def _account_id_arg(args: dict) -> str:
+    account_id = str(args.get("account") or "")
+    if not account_id or len(account_id) > 128 or "/" in account_id:
+        raise HTTPException(400, "Invalid account")
+    return account_id
+
+
+def _op_branch_report(args: dict, caller: Optional[dict]):
+    account_id = _account_id_arg(args)
+    device_id, _ = _device_args(args)
+    branch_id = str(args.get("branch_id") or "")
+    token = str(args.get("install_token") or "")
+    data = args.get("data")
+    if not device_id or not token or not _BRANCH_ID.match(branch_id) or not isinstance(data, dict):
+        raise HTTPException(400, "Invalid branch report")
+    if len(json.dumps(data, default=str)) > _MAX_REPORT_BYTES:
+        raise HTTPException(413, "Branch report too large")
+
+    acc_ref = firestore.client().collection("accounts").document(account_id)
+    snap = acc_ref.get()
+    account = snap.to_dict() if snap.exists else None
+    expected = ((account or {}).get("installTokens") or {}).get(device_id) or {}
+    if not account or not hmac.compare_digest(str(expected.get("hash") or ""), _hash(token)):
+        raise HTTPException(403, "This PC is not linked to that account")
+    if account.get("status") == "blocked":
+        raise HTTPException(403, "This account has been blocked. Contact the developer.")
+
+    acc_ref.collection("branches").document(branch_id).set({
+        **data,
+        "branchId": branch_id,
+        "deviceId": device_id,
+        "receivedAt": firestore.SERVER_TIMESTAMP,
+    })
+    return None
+
+
+def _plain(value):
+    """Firestore timestamps as ISO text, so the answer is plain JSON."""
+    if isinstance(value, datetime.datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {k: _plain(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_plain(v) for v in value]
+    return value
+
+
+def _op_branch_list(args: dict, caller: Optional[dict]):
+    """Every branch of the calling admin's own account."""
+    caller = _require_admin(caller)
+    account_id = _account_of(caller)
+    if not account_id:
+        return []
+    out = []
+    for doc in firestore.client().collection("accounts").document(account_id).collection("branches").stream():
+        data = _plain(doc.to_dict() or {})
+        data["branch_id"] = data.pop("branchId", doc.id)
+        data.pop("deviceId", None)
+        data["received_at"] = data.pop("receivedAt", None)
+        out.append(data)
+    out.sort(key=lambda b: str(b.get("name") or ""))
+    return out
+
+
+def _op_account_of(args: dict, caller: Optional[dict]):
+    """Which pharmacy the caller belongs to — for a token that does not say."""
+    caller = _require_caller(caller)
+    return {"account": _account_of(caller)}
 
 
 def _op_session_active(args: dict, caller: Optional[dict]):
@@ -751,6 +877,27 @@ def _op_fs_set(args: dict, caller: Optional[dict]):
     if caller and doc != _caller_uid(caller):
         raise HTTPException(403, "You can only write your own dashboard")
 
+    # A PC holding its install token (branch reports, above) proves itself:
+    # the dashboard it writes must belong to an admin of its own account.
+    if not caller and args.get("install_token"):
+        account_id = _account_id_arg(args)
+        device_id, _ = _device_args(args)
+        acc = firestore.client().collection("accounts").document(account_id).get()
+        account = acc.to_dict() if acc.exists else None
+        expected = ((account or {}).get("installTokens") or {}).get(device_id) or {}
+        if not account or not hmac.compare_digest(str(expected.get("hash") or ""), _hash(str(args["install_token"]))):
+            raise HTTPException(403, "This PC is not linked to that account")
+        owner = account.get("adminUid") == doc
+        if not owner:
+            try:
+                owner = (fb_auth.get_user(doc).custom_claims or {}).get("account") == account_id
+            except Exception:
+                owner = False
+        if not owner:
+            raise HTTPException(403, "That dashboard belongs to another pharmacy")
+    elif not caller and not LEGACY_DASHBOARD_WRITES:
+        raise HTTPException(401, "An install token is required")
+
     firestore.client().collection(coll).document(doc).set(args.get("data") or {})
     return None
 
@@ -771,6 +918,9 @@ HANDLERS = {
     "fs.query": _op_fs_query,
     "fs.update": _op_fs_update,
     "fs.set": _op_fs_set,
+    "branch.report": _op_branch_report,
+    "branch.list": _op_branch_list,
+    "account.of": _op_account_of,
 }
 
 
